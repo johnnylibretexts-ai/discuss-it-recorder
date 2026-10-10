@@ -1,15 +1,27 @@
 // Background failures must never revoke camera access or expose a raw frame.
 const appleMobile = () => /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
 const unavailable = () => new Error('Background effects could not start. Tap Retry preview, or explicitly select None. Your camera permission does not need to be changed.')
+const interrupted = () => new Error('The background effect stopped responding, so recording stopped. Review your clip, or record it again.')
 
 export default class BackgroundProcessor {
+  constructor (assetBase) {
+    // The worker, module, WASM and model all load from this one host-chosen directory. An
+    // unset (null or empty) value means the default. MediaPipe appends file names to the
+    // WASM directory, so a query string or fragment cannot apply and is dropped.
+    const assets = new URL(assetBase || '/assets/discuss-it/', document.baseURI)
+    assets.search = ''
+    assets.hash = ''
+    if (!assets.pathname.endsWith('/')) assets.pathname += '/'
+    this.assets = assets.href
+  }
+
   async init () {
     this.closed = false
     // iOS browser apps share platform-specific capture/WebGL constraints. Use a
     // DOM canvas here rather than relying on worker OffscreenCanvas support.
     if (appleMobile()) return this.initMain()
     try {
-      this.worker = new Worker('/assets/discuss-it/segmenter-worker.js')
+      this.worker = new Worker(`${this.assets}segmenter-worker.js`)
       await this.request({ type: 'init' }, [], 45000)
     } catch (error) {
       this.stopWorker()
@@ -23,13 +35,13 @@ export default class BackgroundProcessor {
     let timeout
     try {
       const load = async () => {
-        const vision = await import(/* webpackIgnore: true */ '/assets/discuss-it/vision_module.js')
+        const vision = await import(/* webpackIgnore: true */ /* @vite-ignore */ `${this.assets}vision_module.js`)
         if (this.closed) throw unavailable()
-        const files = await vision.FilesetResolver.forVisionTasks('/assets/discuss-it/wasm')
+        const files = await vision.FilesetResolver.forVisionTasks(`${this.assets}wasm`)
         if (this.closed) throw unavailable()
         const model = await vision.ImageSegmenter.createFromOptions(files, {
           canvas: document.createElement('canvas'),
-          baseOptions: { modelAssetPath: '/assets/discuss-it/selfie_segmenter.tflite', delegate: 'CPU' },
+          baseOptions: { modelAssetPath: `${this.assets}selfie_segmenter.tflite`, delegate: 'CPU' },
           runningMode: 'VIDEO',
           outputCategoryMask: false,
           outputConfidenceMasks: true
@@ -56,7 +68,8 @@ export default class BackgroundProcessor {
     })
   }
 
-  async mask (canvas, timestamp) {
+  // recover() is asked only when the worker fails, so the caller can answer for that moment.
+  async mask (canvas, timestamp, { recover = () => true } = {}) {
     if (this.closed) throw unavailable()
     if (this.worker) {
       let frame
@@ -68,7 +81,11 @@ export default class BackgroundProcessor {
         if (frame) frame.close()
         this.stopWorker()
         if (this.closed) throw error
-        await this.initMain()
+        // Reloading on the main thread can freeze frames for up to 45 s. During a
+        // take, stop with an explanation instead of recording a frozen picture.
+        if (!recover()) throw interrupted()
+        this.recovering = true
+        try { await this.initMain() } finally { this.recovering = false }
       }
     }
     if (!this.model || this.closed) throw unavailable()

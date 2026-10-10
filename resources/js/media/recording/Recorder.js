@@ -15,10 +15,11 @@ export function extensionFor (mimeType) {
 }
 
 export default class Recorder {
-  constructor (canvas, onState = () => {}, onError = () => {}) {
+  constructor (canvas, onState = () => {}, onError = () => {}, { assetBase } = {}) {
     this.canvas = canvas
     this.onState = onState
     this.onError = onError
+    this.assetBase = assetBase
     this.state = 'idle'
     this.generation = 0
     this.video = document.createElement('video')
@@ -43,6 +44,8 @@ export default class Recorder {
   async prepare (settings) {
     if (['recording', 'finalizing', 'disposed'].includes(this.state)) throw new Error('Stop the recording before changing settings.')
     if (this.state === 'preparing') return
+    // A new session has no take yet; stop() must not return the previous one.
+    this.result = null
     const generation = ++this.generation
     const previous = this.settings
     const next = { facingMode: 'user', background: 'none', mirror: false, audioOnly: false, ...settings }
@@ -116,7 +119,7 @@ export default class Recorder {
   }
 
   async prepareWorker () {
-    this.processor = new BackgroundProcessor()
+    this.processor = new BackgroundProcessor(this.assetBase)
     await this.processor.init()
   }
 
@@ -130,7 +133,9 @@ export default class Recorder {
       ctx.globalCompositeOperation = 'source-over'
       ctx.drawImage(this.video, 0, 0, width, height)
       if (this.processor) {
-        const mask = await this.processor.mask(this.stage, performance.now())
+        // Decide when a worker request fails, not when it is sent: a request sent in preview
+        // can time out after Start, and a take must not reload the model mid-recording.
+        const mask = await this.processor.mask(this.stage, performance.now(), { recover: () => ['preparing', 'preview'].includes(this.state) })
         if (generation !== this.generation) return
         if (!this.maskCanvas) this.maskCanvas = document.createElement('canvas')
         this.maskCanvas.width = mask.width
@@ -169,46 +174,73 @@ export default class Recorder {
 
   start () {
     if (this.state !== 'preview') throw new Error('Prepare the camera first.')
+    if (this.processor && this.processor.recovering) throw new Error('The background effect is restarting. Wait for the preview to move again, then record.')
     this.chunks = []
     this.bytes = 0
-    this.output = this.settings.audioOnly ? this.stream : new MediaStream([
-      ...this.canvas.captureStream(15).getVideoTracks(), ...this.stream.getAudioTracks()
-    ])
+    const captured = this.settings.audioOnly ? [] : this.canvas.captureStream(15).getVideoTracks()
+    const output = this.settings.audioOnly ? this.stream : new MediaStream([...captured, ...this.stream.getAudioTracks()])
     const mimeType = recordingFormat(MediaRecorder, this.settings.audioOnly)
-    this.recorder = new MediaRecorder(this.output, { ...(mimeType ? { mimeType } : {}), videoBitsPerSecond: 1200000, audioBitsPerSecond: 64000 })
-    this.result = new Promise((resolve, reject) => {
-      this.recorder.ondataavailable = ({ data }) => {
-        if (data.size) { this.chunks.push(data); this.bytes += data.size }
-        if (this.bytes >= 75000000 && this.state === 'recording') this.stop()
-      }
-      this.recorder.onerror = () => { reject(new Error('Recording failed. Please retake the clip.')); this.fail(new Error('Recording failed.')) }
-      this.recorder.onstop = () => {
-        try {
-          const type = this.recorder.mimeType || (this.chunks[0] && this.chunks[0].type) || mimeType
-          const blob = new Blob(this.chunks, { type })
-          if (!blob.size) throw new Error('The recording was empty. Please try again.')
-          resolve({ blob, mimeType: type, extension: extensionFor(type), durationMs: performance.now() - this.started })
-        } catch (error) { reject(error) } finally { ++this.generation; this.release(); if (this.state !== 'disposed') this.setState('review') }
-      }
-    })
-    // A consumer may await stop later; avoid an unhandled rejection in the meantime.
-    this.result.catch(() => {})
-    this.recorder.start(1000)
+    let recorder
+    let result
+    try {
+      recorder = new MediaRecorder(output, { ...(mimeType ? { mimeType } : {}), videoBitsPerSecond: 1200000, audioBitsPerSecond: 64000 })
+      result = new Promise((resolve, reject) => {
+        recorder.ondataavailable = ({ data }) => {
+          if (data.size) { this.chunks.push(data); this.bytes += data.size }
+          if (this.bytes >= 75000000 && this.state === 'recording') this.stop()
+        }
+        recorder.onerror = () => {
+          // A take ended by dispose() was abandoned, whatever its MediaRecorder reports afterwards.
+          reject(this.state === 'disposed' ? new DOMException('The recording was cancelled.', 'AbortError') : new Error('Recording failed. Please retake the clip.'))
+          this.fail(new Error('Recording failed.'))
+        }
+        recorder.onstop = () => {
+          try {
+            // A take ended by dispose() was abandoned, even though its data arrived.
+            if (this.state === 'disposed') throw new DOMException('The recording was cancelled.', 'AbortError')
+            const type = recorder.mimeType || (this.chunks[0] && this.chunks[0].type) || mimeType
+            const blob = new Blob(this.chunks, { type })
+            if (!blob.size) throw new Error('The recording was empty. Please try again.')
+            resolve({ blob, mimeType: type, extension: extensionFor(type), durationMs: performance.now() - this.started })
+          } catch (error) { reject(error) } finally {
+            // The handlers hold this take's promise and Blob; drop them so a later prepare() frees it.
+            recorder.ondataavailable = recorder.onerror = recorder.onstop = null
+            this.chunks = []; ++this.generation; this.release(); if (this.state !== 'disposed') this.setState('review')
+          }
+        }
+      })
+      // A consumer may await stop later; avoid an unhandled rejection in the meantime.
+      result.catch(() => {})
+      recorder.start(1000)
+    } catch (error) {
+      // Stay in preview: stop only the canvas capture made for this attempt, not the camera or microphone.
+      captured.forEach(track => track.stop())
+      throw error
+    }
+    this.recorder = recorder
+    this.output = output
+    this.result = result
     this.started = performance.now()
     this.setState('recording')
     this.limitTimer = setTimeout(() => this.stop(), 300000)
-    return this.result
+    return result
   }
 
   stop () {
     if (this.state === 'recording') { this.setState('finalizing'); if (this.recorder.state !== 'inactive') this.recorder.stop() }
-    return this.result
+    if (this.result) return this.result
+    const none = Promise.reject(new DOMException('No recording has been started.', 'InvalidStateError'))
+    none.catch(() => {})
+    return none
   }
 
   fail (error) {
+    // Once a take is ending, its promise reports what matters. A late effect error from a
+    // frame drawn before MediaRecorder stops must not replace the explanation already given.
+    if (this.state === 'finalizing' || this.state === 'disposed') return
     this.onError(error)
     if (this.state === 'recording') this.stop()
-    else if (this.state !== 'finalizing' && this.state !== 'disposed') {
+    else {
       ++this.generation
       this.releaseEffects()
       if (this.stream && this.stream.getTracks().every(track => track.readyState === 'live')) this.setState('setup-error')

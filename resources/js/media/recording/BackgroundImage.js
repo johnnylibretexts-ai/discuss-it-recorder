@@ -22,8 +22,12 @@ export default async function loadBackgroundImage (file, signal) {
     await new Promise((resolve, reject) => {
       abort = () => reject(new DOMException('Background image loading cancelled.', 'AbortError'))
       const unreadable = () => reject(new Error('This browser could not open that background photo. Choose a JPG/PNG copy or a screenshot instead.'))
-      // Wait for decoded pixels, not just completed file loading, before drawing.
-      image.onload = () => { image.decode().then(resolve, unreadable) }
+      // Check the header dimensions before decode() allocates every pixel, then
+      // wait for decoded pixels, not just completed file loading, before drawing.
+      image.onload = () => {
+        if (!image.naturalWidth || !image.naturalHeight || image.naturalWidth * image.naturalHeight > 50000000) reject(new Error('Choose a background photo no larger than 50 megapixels, or use a screenshot.'))
+        else image.decode().then(resolve, unreadable)
+      }
       image.onerror = unreadable
       if (signal) {
         signal.addEventListener('abort', abort, { once: true })
@@ -34,7 +38,6 @@ export default async function loadBackgroundImage (file, signal) {
     })
     const width = image.naturalWidth
     const height = image.naturalHeight
-    if (!width || !height || width * height > 50000000) throw new Error('Choose a background photo no larger than 50 megapixels, or use a screenshot.')
     const scale = Math.min(1, 640 / Math.max(width, height))
     const source = document.createElement('canvas')
     source.width = Math.max(1, Math.round(width * scale))

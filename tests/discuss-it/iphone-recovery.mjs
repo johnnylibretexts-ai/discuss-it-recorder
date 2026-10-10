@@ -9,7 +9,7 @@ const root = process.cwd()
 const component = fs.readFileSync(path.join(root, 'resources/js/components/recording/VideoRecorder.vue'), 'utf8')
 const server = http.createServer((req, res) => {
   res.setHeader('Content-Type', 'application/javascript')
-  if (req.url === '/') { res.setHeader('Content-Type', 'text/html'); res.end('<meta name="viewport" content="width=device-width"><div id="app"></div><script type="module">import Vue from "/vue.js"; import Component from "/Component.js"; new Vue({render:h=>h(Component)}).$mount("#app")</script>'); return }
+  if (req.url === '/') { res.setHeader('Content-Type', 'text/html'); res.end('<meta name="viewport" content="width=device-width"><div id="app"></div><script type="module">import Vue from "/vue.js"; import Component from "/Component.js"; window.recordedEvents = []; window.recordingEvents = []; new Vue({render:h=>h(Component, { on: { recorded: result => window.recordedEvents.push(result ? "take" : null), recording: value => window.recordingEvents.push(value) } })}).$mount("#app")</script>'); return }
   if (req.url === '/Component.js') {
     const script = component.match(/<script>([\s\S]*?)<\/script>/)[1].replace("'../../media/recording/Recorder'", "'/Recorder.js'").replace("'../../media/recording/BackgroundImage.js'", "'/BackgroundImage.js'").replace('export default', 'const component =')
     res.end(`${script}\ncomponent.template = ${JSON.stringify(component.match(/<template>([\s\S]*?)<\/template>/)[1])}; export default component`); return
@@ -29,17 +29,15 @@ try {
   page.on('pageerror', error => console.log('Test page error:', error.message))
   const installCapture = () => {
     window.captureRequests = 0
-    // Keep the WebKit native wrapper alive; expando mocks on a collected wrapper
-    // can otherwise disappear between setup and a later UI tap.
-    window.testMediaDevices = navigator.mediaDevices
-    Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: window.testMediaDevices })
     window.rejectPlayback = true
     const originalPlay = HTMLMediaElement.prototype.play
     HTMLMediaElement.prototype.play = function () {
       if (this.srcObject && window.rejectPlayback) { window.rejectPlayback = false; return Promise.reject(new DOMException('Playback requires a user gesture', 'NotAllowedError')) }
       return originalPlay.call(this)
     }
-    navigator.mediaDevices.getUserMedia = async () => {
+    // Replace capture on the prototype: WebKit can discard the navigator.mediaDevices
+    // wrapper with any instance overrides, and a later tap would open the real camera.
+    MediaDevices.prototype.getUserMedia = async function syntheticCapture () {
       window.captureRequests++
       const source = document.createElement('canvas'); source.width = 320; source.height = 240
       const paint = () => { const ctx = source.getContext('2d'); ctx.fillStyle = '#f00'; ctx.fillRect(0, 0, 160, 240); ctx.fillStyle = '#00f'; ctx.fillRect(160, 0, 160, 240) }
@@ -48,7 +46,7 @@ try {
       window.cameraStream = new MediaStream([...source.captureStream(15).getVideoTracks(), ...output.stream.getAudioTracks()])
       return window.cameraStream
     }
-    navigator.mediaDevices.enumerateDevices = async () => []
+    MediaDevices.prototype.enumerateDevices = async () => []
   }
   await page.goto(`http://127.0.0.1:${server.address().port}`)
   await page.evaluate(installCapture)
@@ -97,6 +95,8 @@ try {
     }, largePhoto)
     const buffer = Buffer.from(photo, 'base64')
     if (largePhoto) assert.ok(buffer.length > 5000000 && buffer.length < 20000000, `Exercise a high-resolution photo larger than the old 5 MB limit (fixture: ${buffer.length} bytes)`)
+    // IMAGE=decoder: photo loading must not depend on createImageBitmap(Blob), whose
+    // failures on iPhone previously left the preview unavailable.
     if (process.env.IMAGE === 'decoder') await page.evaluate(() => {
       const original = window.createImageBitmap
       window.createImageBitmap = (source, ...args) => source instanceof Blob ? Promise.reject(new DOMException('The image could not be decoded', 'InvalidStateError')) : original(source, ...args)
@@ -131,5 +131,59 @@ try {
     return green / (pixels.length / 4) > 20
   }), 'Custom photo must be encoded in the saved recording')
   assert.ok(await page.evaluate(() => window.cameraStream.getTracks().every(track => track.readyState === 'ended')))
+  assert.deepEqual(await page.evaluate(() => window.recordingEvents), [true, false], '`recording` marks when the take starts and stops')
   console.log('PASS recovered iPhone-mode preview records and releases camera on review')
+  // Cancel during a take discards it, and Cancel without a take leaves the host's attachment alone.
+  assert.deepEqual(await page.evaluate(() => window.recordedEvents), ['take'])
+  page.once('dialog', dialog => dialog.accept())
+  await page.getByRole('button', { name: 'Retake', exact: true }).click()
+  await page.getByRole('button', { name: 'Start recording', exact: true }).waitFor({ timeout: 60000 })
+  assert.deepEqual(await page.evaluate(() => window.recordedEvents), ['take', null], 'Retake clears the previous take')
+  await page.getByRole('button', { name: 'Start recording', exact: true }).click()
+  await page.waitForTimeout(1200)
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click()
+  await page.waitForTimeout(1500)
+  assert.equal(await page.getByRole('link', { name: 'Download a copy', exact: true }).count(), 0, 'A cancelled take is not offered for download')
+  assert.equal(await page.getByLabel('Review recording', { exact: true }).count(), 0, 'A cancelled take is not shown for review')
+  assert.equal(await page.getByRole('alert').count(), 0, 'Cancelling is not an error')
+  assert.deepEqual(await page.evaluate(() => window.recordedEvents), ['take', null], 'A cancelled take is never emitted')
+  assert.deepEqual(await page.evaluate(() => window.recordingEvents), [true, false, true, false], 'Cancelling a take also ends `recording`')
+  await page.getByRole('button', { name: 'Enable camera & microphone', exact: true }).click()
+  await page.getByRole('button', { name: 'Start recording', exact: true }).waitFor({ timeout: 60000 })
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click()
+  assert.deepEqual(await page.evaluate(() => window.recordedEvents), ['take', null], 'Cancel without a take does not clear the host attachment')
+  console.log('PASS cancelled takes are discarded and Cancel without a take keeps the host attachment')
+  // A missing microphone fails while a camera is selected, but the camera is still there,
+  // so it stays selected. Chromium reports it as NotFoundError; Safari may report
+  // OverconstrainedError, as Chromium does for an exact camera that is unplugged.
+  const camera = page.getByRole('combobox', { name: /^Camera/ })
+  await page.evaluate(() => {
+    window.usbCamera = 'no-microphone'
+    MediaDevices.prototype.enumerateDevices = async () => window.usbCamera === 'unplugged' ? [] : [{ deviceId: 'usb-camera', groupId: '', kind: 'videoinput', label: 'USB camera' }]
+    const getUserMedia = MediaDevices.prototype.getUserMedia
+    MediaDevices.prototype.getUserMedia = async function syntheticCapture (constraints) {
+      if (constraints.video && constraints.video.deviceId && window.usbCamera !== 'connected') throw new DOMException('', window.usbCamera === 'unplugged' ? 'OverconstrainedError' : 'NotFoundError')
+      return getUserMedia.call(this, constraints)
+    }
+  })
+  await page.getByRole('button', { name: 'Enable camera & microphone', exact: true }).click()
+  await page.getByRole('button', { name: 'Start recording', exact: true }).waitFor({ timeout: 60000 })
+  await camera.selectOption('usb-camera')
+  await page.getByRole('alert').filter({ hasText: 'microphone was found' }).waitFor()
+  await page.waitForTimeout(500)
+  assert.equal(await camera.inputValue(), 'usb-camera', 'A missing microphone keeps the selected camera')
+  await page.evaluate(() => { window.usbCamera = 'connected' })
+  await page.getByRole('button', { name: 'Enable camera & microphone', exact: true }).click()
+  await page.getByRole('button', { name: 'Start recording', exact: true }).waitFor({ timeout: 60000 })
+  console.log('PASS a missing microphone keeps the selected camera for the retry')
+  // Errors without a message are still explained, and a camera that disappeared is
+  // deselected so a retry can use the default camera.
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click()
+  await page.evaluate(() => { window.usbCamera = 'unplugged' })
+  await page.getByRole('button', { name: 'Enable camera & microphone', exact: true }).click()
+  await page.getByRole('alert').filter({ hasText: 'not available' }).waitFor()
+  await page.waitForFunction(() => document.querySelector('.discuss-recorder select').value === '', null, { timeout: 5000 }).catch(() => { throw Error('The unplugged camera is no longer selected') })
+  await page.getByRole('button', { name: 'Enable camera & microphone', exact: true }).click()
+  await page.getByRole('button', { name: 'Start recording', exact: true }).waitFor({ timeout: 60000 })
+  console.log('PASS an error without a message is explained and the default camera works on retry')
 } finally { await browser.close(); server.close() }

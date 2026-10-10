@@ -43,7 +43,7 @@
 import Recorder from '../../media/recording/Recorder'
 import { validateBackgroundImage } from '../../media/recording/BackgroundImage.js'
 export default {
-  props: { audioOnly: { type: Boolean, default: false } },
+  props: { audioOnly: { type: Boolean, default: false }, assetBase: String },
   data: () => ({ state: 'idle', error: '', devices: [], deviceId: '', facingMode: 'user', mirror: false, background: 'none', image: null, result: null, reviewUrl: '', seconds: 0 }),
   computed: {
     locked () { return ['preparing', 'recording', 'finalizing', 'review'].includes(this.state) },
@@ -52,11 +52,39 @@ export default {
   mounted () { this.makeRecorder() },
   beforeDestroy () { this.recorder.dispose(); clearInterval(this.ticker); this.clearResult() },
   methods: {
-    makeRecorder () { this.recorder = new Recorder(this.$refs.canvas, state => { this.state = state; this.$emit('busy', ['preparing', 'preview', 'setup-error', 'recording', 'finalizing'].includes(state)) }, error => { this.error = error.message }) },
-    clearResult () { if (this.reviewUrl) URL.revokeObjectURL(this.reviewUrl); this.reviewUrl = ''; this.result = null; this.$emit('recorded', null) },
+    // Cancel and Retake dispose the recorder before replacing it, and a disposed Recorder
+    // reports no further state or errors; its take rejects with an AbortError.
+    makeRecorder () {
+      this.recorder = new Recorder(this.$refs.canvas, state => {
+        // Hosts time a take from `recording`; `busy` also covers the preview.
+        if ((state === 'recording') !== (this.state === 'recording')) this.$emit('recording', state === 'recording')
+        this.state = state; this.$emit('busy', ['preparing', 'preview', 'setup-error', 'recording', 'finalizing'].includes(state))
+      }, error => { this.error = this.describe(error) }, { assetBase: this.assetBase })
+    },
+    // Some browser errors, such as OverconstrainedError, have an empty message.
+    describe (error) {
+      return ({
+        NotAllowedError: 'Camera or microphone permission was denied. Allow access in browser settings, then try again.',
+        NotFoundError: 'No camera or microphone was found. Connect one, then try again.',
+        NotReadableError: 'The camera or microphone is being used by another app. Close that app, then try again.',
+        OverconstrainedError: 'The selected camera is not available. Try again to use the default camera, or choose another camera.'
+      })[error.name] || error.message || 'The recorder could not start. Please try again.'
+    },
+    // Only clear the host's attachment when this recorder produced one.
+    clearResult () { if (this.reviewUrl) URL.revokeObjectURL(this.reviewUrl); if (this.result) this.$emit('recorded', null); this.reviewUrl = ''; this.result = null },
     async prepare () {
       this.error = ''
-      try { this.devices = (await this.recorder.prepare({ deviceId: this.deviceId, facingMode: this.facingMode, mirror: this.mirror, background: this.background, image: this.image, audioOnly: this.audioOnly })) || this.devices } catch (error) { this.error = error.name === 'NotAllowedError' ? 'Camera or microphone permission was denied. Allow access in browser settings, then try again.' : error.message }
+      try { this.devices = (await this.recorder.prepare({ deviceId: this.deviceId, facingMode: this.facingMode, mirror: this.mirror, background: this.background, image: this.image, audioOnly: this.audioOnly })) || this.devices } catch (error) {
+        this.error = this.describe(error)
+        // A camera that disappeared would fail every retry the same way. A missing microphone
+        // fails the same way (NotFoundError, or OverconstrainedError in Safari) while the
+        // selected camera is still there, so deselect only a camera the browser no longer lists.
+        if (this.deviceId && ['OverconstrainedError', 'NotFoundError'].includes(error.name) && await this.cameraMissing(this.deviceId)) this.deviceId = ''
+      }
+    },
+    async cameraMissing (deviceId) {
+      try { this.devices = (await navigator.mediaDevices.enumerateDevices()).filter(device => device.kind === 'videoinput') } catch (error) { return false }
+      return !this.devices.some(device => device.deviceId === deviceId)
     },
     changed () { if (['preview', 'setup-error'].includes(this.state)) this.prepare() },
     switchCamera () { this.facingMode = this.facingMode === 'user' ? 'environment' : 'user'; this.deviceId = ''; this.changed() },
@@ -73,13 +101,17 @@ export default {
     },
     async start () {
       this.error = ''; this.seconds = 0
+      let ticker
       try {
         const promise = this.recorder.start()
-        this.ticker = setInterval(() => { this.seconds++ }, 1000)
+        // Keep this take's own ticker: after Cancel, a new take may have started its own.
+        ticker = this.ticker = setInterval(() => { this.seconds++ }, 1000)
         const result = await promise
-        if (this.recorder.state === 'disposed') return
         this.result = result; this.reviewUrl = URL.createObjectURL(result.blob); this.$emit('recorded', result)
-      } catch (error) { this.error = error.message } finally { clearInterval(this.ticker) }
+      } catch (error) {
+        // A take ended by Cancel or Retake rejects with AbortError; it is not a result or an error.
+        if (error.name !== 'AbortError') this.error = this.describe(error)
+      } finally { clearInterval(ticker) }
     },
     stop () { this.recorder.stop() },
     cancel () { this.recorder.dispose(); clearInterval(this.ticker); this.clearResult(); this.makeRecorder(); this.state = 'idle'; this.$emit('busy', false) },

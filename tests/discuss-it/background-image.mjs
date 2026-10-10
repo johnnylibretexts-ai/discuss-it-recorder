@@ -4,8 +4,21 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import assert from 'node:assert/strict'
+import zlib from 'node:zlib'
 import { execFileSync } from 'node:child_process'
 const { webkit, chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright')
+// A valid 8000x7000 (56-megapixel) one-bit PNG that is only a few kilobytes on disk.
+function oversizedPng (width = 8000, height = 7000) {
+  const chunk = (type, data) => {
+    const body = Buffer.concat([Buffer.from(type), data])
+    const length = Buffer.alloc(4); length.writeUInt32BE(data.length)
+    const crc = Buffer.alloc(4); crc.writeUInt32BE(zlib.crc32(body))
+    return Buffer.concat([length, body, crc])
+  }
+  const header = Buffer.alloc(13); header.writeUInt32BE(width, 0); header.writeUInt32BE(height, 4); header[8] = 1
+  const rows = Buffer.alloc(height * (1 + Math.ceil(width / 8)))
+  return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', header), chunk('IDAT', zlib.deflateSync(rows)), chunk('IEND', Buffer.alloc(0))])
+}
 const server = http.createServer((req, res) => {
   if (req.url === '/BackgroundImage.js') {
     res.setHeader('Content-Type', 'application/javascript')
@@ -19,7 +32,7 @@ let fixtureDirectory
 try {
   const page = await browser.newPage()
   await page.goto(`http://127.0.0.1:${server.address().port}`)
-  const result = await page.evaluate(async () => {
+  const result = await page.evaluate(async oversized => {
     const { default: load, validateBackgroundImage: validate } = await import('/BackgroundImage.js')
     const activeUrls = new Set()
     const create = URL.createObjectURL.bind(URL); const revoke = URL.revokeObjectURL.bind(URL)
@@ -49,6 +62,13 @@ try {
     let corruptRejected = false
     try { await load(new File(['broken'], 'photo.jpg', { type: 'image/jpeg' })) } catch (error) { corruptRejected = error.message.includes('JPG/PNG copy') }
     assert(corruptRejected, 'Unreadable images must offer a specific recovery action')
+    const decode = HTMLImageElement.prototype.decode
+    let decodes = 0
+    HTMLImageElement.prototype.decode = function () { decodes++; return decode.call(this) }
+    let oversizedRejected = false
+    try { await load(new File([Uint8Array.from(atob(oversized), c => c.charCodeAt(0))], 'huge.png', { type: 'image/png' })) } catch (error) { oversizedRejected = error.message.includes('50 megapixels') }
+    HTMLImageElement.prototype.decode = decode
+    assert(oversizedRejected && decodes === 0, `Photos over 50 megapixels are rejected before decoding (rejected: ${oversizedRejected}, decodes: ${decodes})`)
     const controller = new AbortController()
     const pending = load(png, controller.signal); controller.abort()
     let cancelled = false
@@ -57,8 +77,8 @@ try {
     assert(activeUrls.size === 0, 'Success, error and cancellation revoke all object URLs')
     canvas.width = 64; canvas.height = 64; ctx.fillStyle = '#26804c'; ctx.fillRect(0, 0, 64, 64)
     return canvas.toDataURL('image/png').split(',')[1]
-  })
-  console.log('PASS JPG/PNG/WebP resizing, missing MIME, validation, corrupt-photo error, cancellation and URL cleanup')
+  }, oversizedPng().toString('base64'))
+  console.log('PASS JPG/PNG/WebP resizing, missing MIME, validation, corrupt-photo error, over-50-megapixel rejection before decode, cancellation and URL cleanup')
   if (process.platform === 'darwin' && process.env.BROWSER !== 'chromium') {
     fixtureDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'discuss-it-photo-test-'))
     const input = path.join(fixtureDirectory, 'synthetic.png'); const output = path.join(fixtureDirectory, 'synthetic.heic')

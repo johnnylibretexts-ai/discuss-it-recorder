@@ -101,6 +101,17 @@ $controller->finalize($assignment, $question, $mediaId, $service);
 check(DB::table('discuss_it_media')->where('id', $mediaId)->value('status') === 'pending', 'finalize queues verification, not an immediate post');
 denied(function () use ($controller, $put, $assignment, $question, $service, $mediaId) { $controller->content($put, $assignment, $question, $mediaId, $service); }, 409, 'processing upload cannot be overwritten');
 denied(function () use ($controller, $assignment, $question, $service, $mediaId) { $controller->store(asUser(2, 3, ['request_id' => '30000000-0000-4000-8000-000000000001', 'media_id' => $mediaId]), $assignment, $question, $service); }, 422, 'unverified media cannot be posted');
+DB::table('discuss_it_media')->where('id', $mediaId)->update(['status' => 'ready', 'created_at' => now()->subHours(3)]);
+check($controller->finalize($assignment, $question, $mediaId, $service)->getStatusCode() === 202, 'finalizing processed media again is accepted after the upload window');
+$staleId = '20000000-0000-4000-8000-000000000002';
+DB::table('discuss_it_media')->insert(['id' => $staleId, 'assignment_id' => 1, 'question_id' => 10, 'user_id' => 2, 'object_key' => 'test/stale', 'kind' => 'video', 'status' => 'uploading', 'created_at' => now()->subHours(3), 'updated_at' => now()->subHours(3)]);
+denied(function () use ($controller, $assignment, $question, $service, $staleId) { $controller->finalize($assignment, $question, $staleId, $service); }, 410, 'an upload that was never stored expires after two hours');
+// content() checks the expiry when the PUT starts, so a slow upload it stored can be finalized later.
+$slowId = '20000000-0000-4000-8000-000000000003';
+DB::table('discuss_it_media')->insert(['id' => $slowId, 'assignment_id' => 1, 'question_id' => 10, 'user_id' => 2, 'object_key' => 'test/slow', 'kind' => 'video', 'status' => 'uploading', 'created_at' => now()->subHours(2)->subMinutes(2), 'updated_at' => now()->subHours(2)->subMinutes(2)]);
+Illuminate\Support\Facades\Storage::disk('s3')->put('test/slow', 'test-media-bytes');
+$controller->finalize($assignment, $question, $slowId, $service);
+check(DB::table('discuss_it_media')->where('id', $slowId)->value('status') === 'pending', 'a stored upload that finished after the two-hour window is finalized');
 $controller->update(asUser(2, 3, ['text' => 'Updated response text']), $assignment, $question, $first, $service);
 check(DB::table('discuss_it_comments')->where('id', $first)->value('text') === 'Updated response text', 'owner can edit ungraded response');
 asUser(2, 3);
@@ -129,5 +140,28 @@ $questionLoader = new App\Http\Controllers\AssignmentSyncQuestionController();
 $discussionQuestion = new App\Question(); $discussionQuestion->id = 135;
 $discussionQuestion->qti_json = json_encode(['questionType' => 'discuss_it', 'prompt' => '<p>Introduce yourself.</p>']);
 check($questionLoader->getAssignmentQuestionSeed($assignment, $discussionQuestion, [], [], 'qti') === '', 'standard assessment loader accepts Discuss-It without answer randomization');
+// Listing comments takes a fixed number of queries, not two more per comment.
+$listing = function () use ($controller, $assignment, $question, $service) {
+    DB::flushQueryLog(); DB::enableQueryLog();
+    $data = $controller->index($assignment, $question, $service)->getData(true);
+    $queries = count(DB::getQueryLog()); DB::disableQueryLog();
+    return [$queries, $data['comments']];
+};
+asUser(1, 2);
+[$fewer] = $listing();
+foreach (range(1, 20) as $i) {
+    DB::table('discuss_it_comments')->insert(['assignment_id' => 1, 'question_id' => 10, 'user_id' => $i % 2 ? 2 : 3, 'group_key' => $i % 2 ? 'section:5' : 'section:6',
+        'request_id' => sprintf('40000000-0000-4000-8000-%012d', $i), 'text' => 'Listing response '.$i, 'satisfied' => true, 'created_at' => now(), 'updated_at' => now()]);
+}
+[$more, $comments] = $listing();
+check($more === $fewer, 'comment listing query count does not grow with the number of comments');
+$authors = array_values(array_unique(array_column($comments, 'author'))); sort($authors);
+check($authors === ['Test 2', 'Test 3'], 'comment authors come from one lookup');
+asUser(2, 3);
+$own = array_filter($listing()[1], function ($comment) { return (int) $comment['user_id'] === 2 && !$comment['deleted_at']; });
+check($own && !array_filter($own, function ($comment) { return $comment['can_edit']; }), 'graded student cannot edit their responses in the listing');
+asUser(3, 3);
+$own = array_filter($listing()[1], function ($comment) { return (int) $comment['user_id'] === 3; });
+check($own && count(array_filter($own, function ($comment) { return $comment['can_edit']; })) === count($own), 'ungraded student can still edit their own responses');
 echo "Completed $passed checks using SQLite memory only.\n";
 $finished = true;

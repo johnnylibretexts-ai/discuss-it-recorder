@@ -14,10 +14,10 @@ index d17ad773c..5588d9d16 100644
                      switch ($question_type) {
 diff --git a/app/Http/Controllers/DiscussItController.php b/app/Http/Controllers/DiscussItController.php
 new file mode 100644
-index 000000000..6471b618b
+index 000000000..d533c1c0d
 --- /dev/null
 +++ b/app/Http/Controllers/DiscussItController.php
-@@ -0,0 +1,238 @@
+@@ -0,0 +1,246 @@
 +<?php
 +
 +namespace App\Http\Controllers;
@@ -38,12 +38,18 @@ index 000000000..6471b618b
 +        $scope = $discuss->scope($assignment, $question);
 +        $comments = [];
 +        if ($scope['settings']['enabled'] || $scope['owner']) {
-+            $comments = $discuss->comments($assignment, $question, $scope)->orderBy('id')->limit(500)->get()->map(function ($row) use ($scope) {
-+                $user = DB::table('users')->where('id', $row->user_id)->first();
-+                $graded = DB::table('submission_files')->where('assignment_id', $row->assignment_id)->where('question_id', $row->question_id)->where('user_id', $row->user_id)->whereNotNull('date_graded')->exists();
++            $rows = $discuss->comments($assignment, $question, $scope)->orderBy('id')->limit(500)->get();
++            $viewer = (int) request()->user()->id;
++            // Look up authors once per page, not once per comment. Viewers can change only their
++            // own responses, so only their own grade matters.
++            $users = $rows->isEmpty() ? collect() : DB::table('users')->whereIn('id', $rows->pluck('user_id')->unique()->values()->all())->get(['id', 'first_name', 'last_name'])->keyBy('id');
++            $graded = $rows->contains(function ($row) use ($viewer) { return (int) $row->user_id === $viewer; }) && $discuss->graded($assignment, $question, $viewer);
++            $comments = $rows->map(function ($row) use ($scope, $users, $graded, $viewer) {
++                $user = $users->get($row->user_id);
++                $own = (int) $row->user_id === $viewer;
 +                $row->author = $user ? trim($user->first_name.' '.$user->last_name) : 'Former participant';
-+                $row->can_edit = !$row->deleted_at && !$graded && (int) $row->user_id === (int) request()->user()->id && $scope['settings']['allow_edit'];
-+                $row->can_delete = !$row->deleted_at && ($scope['owner'] || (!$graded && (int) $row->user_id === (int) request()->user()->id && $scope['settings']['allow_delete']));
++                $row->can_edit = !$row->deleted_at && $own && !$graded && $scope['settings']['allow_edit'];
++                $row->can_delete = !$row->deleted_at && ($scope['owner'] || ($own && !$graded && $scope['settings']['allow_delete']));
 +                if ($row->deleted_at) { $row->text = '[Removed]'; $row->media_id = null; $row->captions = null; }
 +                unset($row->request_id);
 +                return $row;
@@ -140,8 +146,7 @@ index 000000000..6471b618b
 +            abort_unless($row, 404);
 +            $moderation = $delete && $scope['owner'];
 +            abort_unless($moderation || ((int) $row->user_id === (int) request()->user()->id && $scope['settings'][$delete ? 'allow_delete' : 'allow_edit']), 403);
-+            $graded = DB::table('submission_files')->where('assignment_id', $assignment->id)->where('question_id', $question->id)->where('user_id', $row->user_id)->whereNotNull('date_graded')->exists();
-+            abort_if($graded && !$moderation, 403, 'Graded responses cannot be changed.');
++            abort_if(!$moderation && $discuss->graded($assignment, $question, (int) $row->user_id), 403, 'Graded responses cannot be changed.');
 +            if ($delete) $values = ['deleted_at' => now()];
 +            else {
 +                abort_unless($row->media_id || trim($data['text'] ?? '') !== '', 422, 'A response cannot be empty.');
@@ -198,9 +203,12 @@ index 000000000..6471b618b
 +    {
 +        $discuss->scope($assignment, $question, true);
 +        $row = $this->ownedMedia($media, $assignment, $question);
-+        abort_unless($row->created_at > now()->subHours(2)->toDateTimeString(), 410, 'Upload expired. Please upload again.');
++        // Finalizing again is harmless. content() checks the expiry when an upload starts, so a
++        // slow upload it accepted can finish after it; only an upload never stored expires here.
 +        if ($row->status === 'uploading') {
-+            abort_unless(Storage::disk('s3')->exists($row->object_key), 422, 'Upload has not completed.');
++            $stored = Storage::disk('s3')->exists($row->object_key);
++            abort_unless($stored || $row->created_at > now()->subHours(2)->toDateTimeString(), 410, 'Upload expired. Please upload again.');
++            abort_unless($stored, 422, 'Upload has not completed.');
 +            abort_if(Storage::disk('s3')->size($row->object_key) > 80000000, 422, 'Video exceeds 80 MB.');
 +            DB::table('discuss_it_media')->where('id', $media)->where('status', 'uploading')->update(['status' => 'pending', 'updated_at' => now()]);
 +        }
@@ -340,10 +348,10 @@ index 06cd9530e..84273a1f3 100644
  
 diff --git a/app/Services/DiscussIt.php b/app/Services/DiscussIt.php
 new file mode 100644
-index 000000000..74033169e
+index 000000000..a0dcb13e5
 --- /dev/null
 +++ b/app/Services/DiscussIt.php
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,95 @@
 +<?php
 +
 +namespace App\Services;
@@ -403,6 +411,13 @@ index 000000000..74033169e
 +        return count(preg_split('/\s+/u', trim($text ?? ''), -1, PREG_SPLIT_NO_EMPTY)) >= $settings['min_words'];
 +    }
 +
++    // Once a student's submission for the question is graded, their responses are locked.
++    public function graded(Assignment $assignment, Question $question, int $userId): bool
++    {
++        return DB::table('submission_files')->where('assignment_id', $assignment->id)->where('question_id', $question->id)
++            ->where('user_id', $userId)->whereNotNull('date_graded')->exists();
++    }
++
 +    public function completion(Assignment $assignment, Question $question, int $userId, array $settings): array
 +    {
 +        $query = DB::table('discuss_it_comments')->where('assignment_id', $assignment->id)->where('question_id', $question->id)
@@ -434,26 +449,39 @@ index 000000000..74033169e
 +}
 diff --git a/app/Services/DiscussItMediaProcessor.php b/app/Services/DiscussItMediaProcessor.php
 new file mode 100644
-index 000000000..d46d2d3ba
+index 000000000..a78ae2ba2
 --- /dev/null
 +++ b/app/Services/DiscussItMediaProcessor.php
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,102 @@
 +<?php
 +
 +namespace App\Services;
 +
 +use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Log;
 +use Illuminate\Support\Facades\Storage;
++use Symfony\Component\Process\Exception\ProcessFailedException;
 +use Symfony\Component\Process\Process;
 +
 +class DiscussItMediaProcessor
 +{
++    // One limit for the input probe and the encoded output. Encoding one second past it
++    // lets the output check catch long input that carries no duration metadata.
++    private const MAX_SECONDS = 301;
++
 +    private function run(array $arguments, int $timeout): string
 +    {
 +        $process = new Process($arguments);
 +        $process->setTimeout($timeout);
 +        $process->mustRun();
 +        return $process->getOutput();
++    }
++
++    // A logger that throws (for example, on a log file another user created) must not
++    // stop the remaining jobs in the batch.
++    private function log(string $level, string $message, array $context): void
++    {
++        try { Log::log($level, $message, $context); } catch (\Throwable $error) {}
 +    }
 +
 +    public function process($media): void
@@ -463,43 +491,64 @@ index 000000000..d46d2d3ba
 +        $disk = Storage::disk('s3');
 +        try {
 +            $size = $disk->size($media->object_key);
-+            if ($size < 1 || $size > 80000000) throw new \RuntimeException('Invalid size');
++            if ($size < 1 || $size > 80000000) throw new \UnexpectedValueException('Invalid size');
 +            $source = $disk->readStream($media->object_key);
 +            $destination = fopen($input, 'wb');
 +            try { $copied = stream_copy_to_stream($source, $destination, 80000001); }
 +            finally { if (is_resource($source)) fclose($source); fclose($destination); }
-+            if ($copied > 80000000 || !$copied) throw new \RuntimeException('Invalid input');
++            if ($copied > 80000000 || !$copied) throw new \UnexpectedValueException('Invalid input');
 +            $formats = 'mov,matroska,webm,mp3,wav,ogg,aac';
-+            $probe = json_decode($this->run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', '-format_whitelist', $formats, '-show_streams', '-show_format', '-of', 'json', $input], 15), true);
++            try {
++                $probe = json_decode($this->run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file', '-format_whitelist', $formats, '-show_streams', '-show_format', '-of', 'json', $input], 15), true);
++            } catch (ProcessFailedException $error) {
++                // ffprobe exits 1 for any input it cannot read; other codes (126/127 for a
++                // missing or unusable binary) are the server's.
++                if ($error->getProcess()->getExitCode() !== 1) throw $error;
++                throw new \UnexpectedValueException('Unreadable input', 0, $error);
++            }
 +            $audio = false;
 +            $video = false;
 +            foreach ($probe['streams'] ?? [] as $stream) {
 +                if ($stream['codec_type'] === 'audio') $audio = true;
 +                if ($stream['codec_type'] === 'video') {
 +                    $video = true;
-+                    if (($stream['width'] ?? 0) * ($stream['height'] ?? 0) > 9000000) throw new \RuntimeException('Resolution too large');
++                    if (($stream['width'] ?? 0) * ($stream['height'] ?? 0) > 9000000) throw new \UnexpectedValueException('Resolution too large');
 +                }
 +            }
-+            if (!$audio || ($media->kind === 'video' && !$video)) throw new \RuntimeException('Missing tracks');
-+            if (isset($probe['format']['duration']) && (float) $probe['format']['duration'] > 301) throw new \RuntimeException('Too long');
-+            $arguments = ['ffmpeg', '-nostdin', '-y', '-v', 'error', '-threads', '2', '-filter_threads', '1', '-protocol_whitelist', 'file', '-format_whitelist', $formats, '-i', $input, '-t', '301'];
++            if (!$audio || ($media->kind === 'video' && !$video)) throw new \UnexpectedValueException('Missing tracks');
++            if (isset($probe['format']['duration']) && (float) $probe['format']['duration'] > self::MAX_SECONDS) throw new \UnexpectedValueException('Too long');
++            $arguments = ['ffmpeg', '-nostdin', '-y', '-v', 'error', '-threads', '2', '-filter_threads', '1', '-protocol_whitelist', 'file', '-format_whitelist', $formats, '-i', $input, '-t', (string) (self::MAX_SECONDS + 1)];
 +            if ($media->kind === 'video') {
 +                $arguments = array_merge($arguments, ['-map', '0:v:0', '-map', '0:a:0', '-vf', "scale=trunc(iw/2)*2:trunc(ih/2)*2", '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '25', '-pix_fmt', 'yuv420p', '-threads', '2']);
 +            } else $arguments = array_merge($arguments, ['-vn', '-map', '0:a:0']);
 +            $arguments = array_merge($arguments, ['-c:a', 'aac', '-b:a', '96k', '-ac', '1', '-map_metadata', '-1', '-movflags', '+faststart', '-f', 'mp4', $output]);
 +            $this->run($arguments, 180);
 +            $duration = (float) trim($this->run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', $output], 15));
-+            if ($duration < 0.1 || $duration > 300.5 || filesize($output) > 80000000) throw new \RuntimeException('Invalid output');
++            // The half second allows for AAC encoder padding at the end of the output.
++            if ($duration < 0.1 || $duration > self::MAX_SECONDS + 0.5 || filesize($output) > 80000000) throw new \UnexpectedValueException('Invalid output');
 +            $key = dirname($media->object_key).'/recording.'.($media->kind === 'video' ? 'mp4' : 'm4a');
 +            $stream = fopen($output, 'rb');
 +            try {
 +                if (!$disk->put($key, $stream, ['visibility' => 'private', 'ContentType' => $media->kind === 'video' ? 'video/mp4' : 'audio/mp4'])) throw new \RuntimeException('Storage failed');
 +            } finally { fclose($stream); }
 +            DB::table('discuss_it_media')->where('id', $media->id)->update(['status' => 'ready', 'output_key' => $key, 'duration_ms' => (int) round($duration * 1000), 'error' => null, 'updated_at' => now()]);
-+            $disk->delete($media->object_key);
++            // The recording is stored and ready, so failing to remove the upload must not fail it.
++            try { $disk->delete($media->object_key); } catch (\Throwable $error) {
++                $this->log('warning', 'Discuss-It upload was not removed after processing', ['media_id' => $media->id, 'exception' => get_class($error)]);
++            }
 +        } catch (\Throwable $error) {
-+            DB::table('discuss_it_media')->where('id', $media->id)->update(['status' => 'failed', 'error' => 'Could not process this recording. Use a clip under 5 minutes / 80 MB with microphone audio, then upload again.', 'updated_at' => now()]);
-+            // Do not log signed URLs, student media, or ffmpeg input diagnostics.
++            // Only problems found in the media itself are the student's to fix: these checks and
++            // an input ffprobe cannot read. Anything else, including an encoder failure or timeout
++            // (a missing encoder, a full disk, an overloaded server), may be the server's.
++            $rejected = $error instanceof \UnexpectedValueException;
++            DB::table('discuss_it_media')->where('id', $media->id)->update(['status' => 'failed', 'error' => $rejected
++                ? 'Could not process this recording. Use a clip under 5 minutes / 80 MB with microphone audio, then upload again.'
++                : 'A server problem stopped this recording from being processed. Please submit again later.', 'updated_at' => now()]);
++            // Log what failed and where, never signed URLs, student media, or ffmpeg input diagnostics.
++            $this->log($rejected ? 'notice' : 'error', 'Discuss-It media processing failed', ['media_id' => $media->id,
++                'exception' => get_class($error), 'at' => basename($error->getFile()).':'.$error->getLine(),
++                'reason' => $error instanceof \UnexpectedValueException ? $error->getMessage() : null,
++                'exit_code' => $error instanceof ProcessFailedException ? $error->getProcess()->getExitCode() : null]);
 +        } finally {
 +            if (is_file($input)) unlink($input);
 +            if (is_file($output)) unlink($output);
@@ -790,14 +839,14 @@ index 000000000..f5431f8e2
 +</style>
 diff --git a/resources/js/components/viewers/DiscussItViewer.vue b/resources/js/components/viewers/DiscussItViewer.vue
 new file mode 100644
-index 000000000..ef29cfdb2
+index 000000000..8d1652da8
 --- /dev/null
 +++ b/resources/js/components/viewers/DiscussItViewer.vue
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,198 @@
 +<template>
 +  <section class="discuss-it" aria-label="Discuss-It">
 +    <h2 class="h4">Discuss-It</h2>
-+    <div v-html="prompt || (qtiJson && qtiJson.prompt)" />
++    <div v-html="safePrompt" />
 +    <p v-if="!assignmentId || !questionId">Discussion responses are available after this question is added to an assignment.</p>
 +    <template v-else>
 +      <p><a :href="`/discuss-it/${assignmentId}/${questionId}`" target="_blank" rel="noopener">Open full-screen discussion (recommended on mobile)</a></p>
@@ -849,6 +898,7 @@ index 000000000..ef29cfdb2
 +
 +<script>
 +import axios from 'axios'
++import DOMPurify from 'dompurify'
 +import { v4 as uuid } from 'uuid'
 +import VideoRecorder from '../recording/VideoRecorder'
 +import DiscussItComment from './DiscussItComment'
@@ -878,7 +928,13 @@ index 000000000..ef29cfdb2
 +    uploadTicket: null,
 +    booleanSettings: { enabled: 'Enable discussion', auto_grade: 'Award completion credit automatically', allow_edit: 'Allow editing ungraded responses', allow_delete: 'Allow deleting ungraded responses', group_by_section: 'Separate discussions by course section' },
 +    numberSettings: { min_threads: 'Required new threads', min_replies: 'Required replies', min_words: 'Minimum words for text', min_seconds: 'Minimum seconds for media' } }),
-+  computed: { base () { return `/api/discuss-it/${this.assignmentId}/${this.questionId}` }, threads () { return this.comments.filter(comment => !comment.parent_id) } },
++  computed: {
++    base () { return `/api/discuss-it/${this.assignmentId}/${this.questionId}` },
++    threads () { return this.comments.filter(comment => !comment.parent_id) },
++    // Question authors write the prompt as HTML; never run their scripts in a viewer's session.
++    // Keep the embedded videos and new-window links the prompt editor can produce.
++    safePrompt () { return DOMPurify.sanitize(this.prompt || (this.qtiJson && this.qtiJson.prompt) || '', { ADD_TAGS: ['iframe'], ADD_ATTR: ['allowfullscreen', 'frameborder', 'target'] }) }
++  },
 +  mounted () { this.load(); this.unload = event => { if (this.composing) { event.preventDefault(); event.returnValue = '' } }; window.addEventListener('beforeunload', this.unload) },
 +  beforeDestroy () { this.disposed = true; window.removeEventListener('beforeunload', this.unload) },
 +  methods: {
@@ -903,18 +959,7 @@ index 000000000..ef29cfdb2
 +      this.error = ''; this.sending = true
 +      try {
 +        if (this.kind !== 'text') {
-+          if (!this.mediaId) {
-+            this.status = 'Requesting upload…'
-+            if (!this.uploadTicket) {
-+              const { data } = await axios.post(`${this.base}/uploads`, { kind: this.kind, size: this.attachment.size })
-+              this.uploadTicket = data
-+            }
-+            const data = this.uploadTicket
-+            this.status = 'Uploading recording…'
-+            await axios.put(data.url, this.attachment, { headers: { 'Content-Type': this.attachment.type || 'application/octet-stream' }, timeout: 180000 })
-+            this.mediaId = data.id
-+          }
-+          await axios.post(`${this.base}/media/${this.mediaId}/finalize`)
++          await this.upload()
 +          this.status = 'Processing recording for mobile playback… This may take a few minutes.'
 +          let ready = false
 +          for (let attempt = 0; attempt < 120; attempt++) {
@@ -929,6 +974,59 @@ index 000000000..ef29cfdb2
 +        await axios.post(`${this.base}/comments`, { request_id: this.requestId, parent_id: this.parentId, text: this.text, captions: this.captions, media_id: this.mediaId, group_key: `section:${this.sectionId}` })
 +        this.composing = false; this.text = ''; this.captions = ''; this.resetAttachment(); this.status = 'Response submitted.'; await this.load()
 +      } catch (error) { this.error = this.message(error); this.status = 'Not submitted. Your response remains available to retry.' } finally { this.sending = false }
++    },
++    async upload () {
++      // Leaving the question mid-upload clears the attachment and ticket, but an upload that
++      // completes must still be finalized, or it counts against the pending-upload limit.
++      const attachment = this.attachment
++      for (let attempt = 0; ; attempt++) {
++        try {
++          let mediaId = this.mediaId
++          if (!mediaId) {
++            let ticket = this.uploadTicket
++            if (!ticket) {
++              this.status = 'Requesting upload…'
++              ticket = (await axios.post(`${this.base}/uploads`, { kind: this.kind, size: attachment.size })).data
++              this.uploadTicket = ticket
++            }
++            await this.send(ticket.url, attachment)
++            mediaId = this.mediaId = ticket.id
++          }
++          await axios.post(`${this.base}/media/${mediaId}/finalize`)
++          return
++        } catch (error) {
++          // An expired (410) or removed (404) upload cannot be reused. Start over once, unless
++          // the student has left the question.
++          if (attempt || this.disposed || !error.response || ![404, 410].includes(error.response.status)) throw error
++          this.mediaId = null; this.uploadTicket = null
++        }
++      }
++    },
++    async send (url, attachment) {
++      // Cancel only when the upload stops making progress, so slow connections can finish.
++      // A cancel token rather than an AbortSignal: axios before 0.22 ignores `signal`.
++      const cancel = axios.CancelToken.source()
++      let stalled = false
++      let timer
++      const wait = milliseconds => { clearTimeout(timer); timer = setTimeout(() => { stalled = true; cancel.cancel() }, milliseconds) }
++      let shown = -1
++      this.status = 'Uploading recording…'
++      wait(60000)
++      try {
++        await axios.put(url, attachment, {
++          headers: { 'Content-Type': attachment.type || 'application/octet-stream' },
++          cancelToken: cancel.token,
++          onUploadProgress: ({ loaded, total }) => {
++            // After the last byte, give the server time to store the file.
++            wait(total && loaded >= total ? 180000 : 60000)
++            const percent = total ? Math.floor(loaded / total * 10) * 10 : -1
++            if (percent > shown) { shown = percent; this.status = `Uploading recording… ${percent}%` }
++          }
++        })
++      } catch (error) {
++        if (stalled) throw new Error('The upload stopped making progress. Check your connection, then submit again.')
++        throw error
++      } finally { clearTimeout(timer) }
 +    }
 +  }
 +}

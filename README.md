@@ -4,7 +4,7 @@ Focused developer handoff for LibreTexts: **not an ADAPT fork and not a complete
 
 ## Try it without ADAPT
 
-Use Node.js 22 or newer:
+Use Node.js 22.2 or newer:
 
 ```sh
 npm ci
@@ -17,7 +17,7 @@ Open `http://127.0.0.1:4173`. Allow camera/microphone, choose a look, record, re
 ## What is reusable?
 
 - `resources/js/media/recording/`: framework-independent browser ES modules. Capture, effect processing and encoding stay on-device.
-- `resources/js/components/recording/VideoRecorder.vue`: optional legacy Vue 2 UI. It emits `busy` and `recorded`; it does not know about users, courses or uploads. Vue 2 is used only by this adapter/demo; a Vue 3 or other UI can call the same core.
+- `resources/js/components/recording/VideoRecorder.vue`: optional legacy Vue 2 UI. It emits `busy`, `recording` and `recorded`; it does not know about users, courses or uploads. Vue 2 is used only by this adapter/demo; a Vue 3 or other UI can call the same core.
 - `resources/vendor/discuss-it/`: pinned segmentation model, license and checksum. `npm run build` copies the installed MediaPipe runtime/WASM into `public/assets/discuss-it/`.
 - `integrations/adapt/`: optional discussion/question-type integration reference, separate from the recorder.
 
@@ -25,7 +25,7 @@ Front/rear switching, device selection, mirroring, blur, neutral color and custo
 
 ## Integrate the recorder
 
-See [the interface contract](docs/INTERFACE.md) and [ADAPT integration](integrations/adapt/README.md). Keep the runtime assets at `/assets/discuss-it/` on the app's own origin; these paths are currently fixed. The host app owns authentication, permissions, posting, storage, validation, grading and captions. Do not treat a browser-produced Blob as trusted server input.
+See [the interface contract](docs/INTERFACE.md) and [ADAPT integration](integrations/adapt/README.md). Serve the runtime assets from the app's own origin: they load from `/assets/discuss-it/` unless you pass another directory as `assetBase`. The host app owns authentication, permissions, posting, storage, validation, grading and captions. Do not treat a browser-produced Blob as trusted server input.
 
 ```js
 import Recorder from './resources/js/media/recording/Recorder.js'
@@ -39,6 +39,18 @@ const { blob, mimeType, extension, durationMs } = await completed
 recorder.dispose() // Also call on navigation/unmount.
 ```
 
+## Add it to LibreTexts ADAPT
+
+LT's ADAPT (`master`) already has Discuss-It; the steps below add the recorder to it. `integrations/adapt/feature.patch` also adds a simpler Discuss-It backend, viewer and question type, built against an older ADAPT baseline. Apply it on an integration branch as [ADAPT integration](integrations/adapt/README.md) describes, and reconcile it with LT's existing Discuss-It files.
+
+LT's Discuss-It records video and audio comments with `resources/js/components/NativeAudioVideoRecorder.vue` (last changed in `e33e6d3a9`, 2025-11-20). The same component records `submission` and `submitted-work` uploads, so one change covers all three.
+
+1. Copy `resources/js/media/recording/`, `resources/js/components/recording/`, `resources/vendor/discuss-it/` and `scripts/build-discuss-it-assets.cjs`, add `@mediapipe/tasks-vision@0.10.32`, and serve the runtime assets as described above.
+2. In `NativeAudioVideoRecorder.vue`, replace the `getUserMedia`/`MediaRecorder` code in `startRecording()` and `stopRecording()` with `VideoRecorder.vue` (pass `audio-only` when `recordingType` is `audio`), or call `Recorder.js` directly.
+3. Keep emitting `startVideoRecording` and `stopVideoRecording` when recording actually starts and stops: `DiscussItViewer.vue` uses them for the minimum-length countdown. Emit them from `VideoRecorder.vue`'s `recording` event (`true` when a take starts, `false` when it ends), not from `busy`, which is also true during the preview. If you call `Recorder.js` directly, use its `recording` state.
+4. On `recorded`, keep the result until the student submits, then pass `result.blob` to the existing `uploadRecording()`. LT's pre-signed upload, storage, threads and permissions stay as they are.
+5. Send `result.mimeType` and `result.extension` with the upload. The component currently labels every video `video/webm` and `temp.webm`, including MP4 that Safari records on iPhone.
+
 ## Tests and device status
 
 ```sh
@@ -46,11 +58,14 @@ npx playwright install chromium webkit
 npm test
 npm run test:ui
 npm run test:demo
+npm run test:all
 ```
 
-Tests use synthetic media, not your camera or ADAPT accounts. On macOS, image tests generate a synthetic HEIC with `sips`; other systems skip that native-codec check. Browser automation is not a real iPhone hardware test.
+`npm run test:all` runs every variant one after another. Each also has its own script: `test:photos:chromium`, `test:webkit`, `test:iphone` (iPhone user agent, main-thread effects), `test:worker-failure`, `test:enumeration-failure`, `test:ui:photo` (a photo over 5 MB as the background) and `test:ui:decoder` (photo loading without `createImageBitmap`). All of them are defined once, in `tests/run.mjs`. `node tests/run.mjs KEY=value file.mjs` runs any test file with environment settings on any shell, and `node tests/run.mjs BACKGROUND=none webkit` adds settings to a named variant. Test settings come only from these arguments; ones exported in your shell are ignored.
 
-Reported physical-device results: Android Chrome works; iPhone Chrome front camera with Blur works. Custom-photo loading received a follow-up fix and passed automated tests; final physical-iPhone confirmation remains pending. See [validation and limitations](docs/VALIDATION.md).
+Tests use synthetic media, not your camera, microphone or ADAPT accounts. On macOS, image tests generate a synthetic HEIC with `sips`; other systems skip that native-codec check. Browser automation is not a real iPhone hardware test.
+
+Reported physical-device results: Android Chrome works; iPhone Chrome front camera with Blur works. Custom-photo loading received a follow-up fix and passes `npm run test:ui:photo` and `npm run test:ui:decoder`; final physical-iPhone confirmation remains pending. See [validation and limitations](docs/VALIDATION.md).
 
 ## Sharing and licensing
 

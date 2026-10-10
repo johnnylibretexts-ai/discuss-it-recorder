@@ -18,6 +18,15 @@ try {
   await page.getByRole('link', { name: 'Download a copy', exact: true }).waitFor()
   assert.ok(await page.getByLabel('Review recording', { exact: true }).evaluate(async video => { video.muted = true; await video.play(); return video.videoWidth > 0 }))
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 2))
+  // A take cancelled while recording is discarded, not offered for review or download.
+  page.once('dialog', dialog => dialog.accept())
+  await page.getByRole('button', { name: 'Retake', exact: true }).click()
+  await page.getByRole('button', { name: 'Start recording', exact: true }).click({ timeout: 60000 })
+  await page.waitForTimeout(1200)
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click()
+  await page.waitForTimeout(1500)
+  assert.equal(await page.getByRole('link', { name: 'Download a copy', exact: true }).count(), 0, 'A cancelled take is not offered for download')
+  assert.equal(await page.getByRole('alert').count(), 0, 'Cancelling is not an error')
   assert.deepEqual(errors, []); assert.deepEqual(writes, [])
-  console.log('PASS standalone demo renders, records, reviews and fits a phone without any upload')
+  console.log('PASS standalone demo renders, records, reviews, discards a cancelled take and fits a phone without any upload')
 } finally { await browser.close(); server.close() }
