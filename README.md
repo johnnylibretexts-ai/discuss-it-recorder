@@ -69,4 +69,4 @@ Reported physical-device results: Android Chrome works; iPhone Chrome front came
 
 ## Sharing and licensing
 
-This is a private source handoff, not an npm publication. The owner can invite LT developers to this repo without giving access to ADAPT. Grant access only to the intended GitHub accounts. Source includes the inherited MIT notice; MediaPipe runtime/model use Apache-2.0. See [LICENSE](LICENSE) and [third-party notices](THIRD_PARTY_NOTICES.md).
+This is a public source repository, not an npm package: `package.json` is marked private only so it cannot be published to npm by mistake. LT developers can use it without access to ADAPT. Report security issues as described in [SECURITY.md](SECURITY.md). Source includes the inherited MIT notice; MediaPipe runtime/model use Apache-2.0. See [LICENSE](LICENSE) and [third-party notices](THIRD_PARTY_NOTICES.md).
